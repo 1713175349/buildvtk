@@ -1,0 +1,91 @@
+name: build-vtk-anari-win-py39
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      VTK_TAG: v9.4.1
+      CMAKE_GENERATOR: Ninja
+      INSTALL_DIR: ${{ github.workspace }}\install
+    steps:
+      - name: Checkout (your repo content if needed)
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9 (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          architecture: 'x64'
+
+      - name: Capture Python executable path
+        shell: pwsh
+        run: |
+          $py = & python -c "import sys; print(sys.executable)"
+          echo "Python3_EXECUTABLE=$py" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Ensure Ninja / toolchain available
+        shell: pwsh
+        run: |
+          choco install ninja -y
+          cmake --version
+          ninja --version
+
+      - name: Bootstrap vcpkg and install ANARI SDK
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          .\vcpkg\vcpkg.exe install anari:x64-windows
+          echo "VCPKG_ROOT=${{ github.workspace }}\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Fetch VTK source (v9.4.1 tag)
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:VTK_TAG https://gitlab.kitware.com/vtk/vtk.git VTK-src
+
+      - name: Configure VTK (ANARI + Python 3.9)
+        shell: pwsh
+        run: |
+          cmake -S VTK-src -B build `
+            -G "$env:CMAKE_GENERATOR" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DBUILD_SHARED_LIBS=ON `
+            -DVTK_BUILD_TESTING=OFF `
+            -DVTK_WRAP_PYTHON=ON `
+            -DVTK_MODULE_ENABLE_VTK_RenderingANARI=YES `
+            -DPython3_EXECUTABLE="$env:Python3_EXECUTABLE" `
+            -DCMAKE_INSTALL_PREFIX="$env:INSTALL_DIR"
+
+      - name: Build & Install
+        shell: pwsh
+        run: |
+          cmake --build build --parallel
+          cmake --install build
+          # make Python able to import installed vtk modules for quick check
+          echo "PYTHONPATH=$env:INSTALL_DIR\lib\site-packages" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Quick verify (targets & Python import)
+        shell: pwsh
+        run: |
+          if (-Not (Test-Path "$env:INSTALL_DIR\lib\cmake\vtk-9.4\VTKTargets.cmake")) { throw "VTK install seems missing" }
+          $anariBuild = Get-ChildItem build -Recurse -Filter *RenderingANARI* | Select-Object -First 1
+          if (-Not $anariBuild) { throw "vtkRenderingANARI artifacts not found in build tree" }
+          python - << 'PYCODE'
+          import os, sys, importlib
+          print("Python:", sys.version)
+          print("PYTHONPATH=", os.environ.get("PYTHONPATH"))
+          m = importlib.import_module("vtkmodules.vtkRenderingANARI")
+          print("Imported:", m.__name__)
+          PYCODE
+
+      - name: Upload artifact (install tree)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtk-9.4.1-win64-py39-anari
+          path: ${{ env.INSTALL_DIR }}
